@@ -9,6 +9,7 @@ import numpy as np
 from itertools import combinations
 import seaborn as sns
 import matplotlib.pyplot as plt
+from pubchempy import get_compounds
 
 
 # Return a soup of the DrugBank page specified.
@@ -50,8 +51,6 @@ def filter_results(entity, chembl_cid):
 # Return the Tanimoto similarity matrix given a DataFrame of SMILES.
 def tanimoto_similarity(dataframe):
     smiles = list(dataframe.smile)
-    num_of_smiles = len(smiles)
-    tanimoto_matrix = np.zeros((num_of_smiles, num_of_smiles))
 
     # Make a list of RDKit fingerprints first.
     fps = []
@@ -65,18 +64,27 @@ def tanimoto_similarity(dataframe):
                 fps_found = FingerprintMols.FingerprintMol(mol)
         fps.append(fps_found)
 
+    # Remove any drugs without a fingerprint?
+    fps = [each for each in fps if each is not None]
+
+    num_of_drugs = len(fps)
+    print(f'{len(smiles)-num_of_drugs} drugs removed')
+
     # Matrix is symmetric, thus only computing the upper-triangular part should suffice.
-    upper_triangular = np.zeros(int((num_of_smiles**2-num_of_smiles)/2))
+    upper_triangular = np.zeros(int((num_of_drugs**2-num_of_drugs)/2))
     for _idx, pair in enumerate(combinations(enumerate(fps), 2)):
         if pair[0][1] and pair[1][1]:
             dist = DataStructs.FingerprintSimilarity(pair[0][1], pair[1][1],
                                                      metric=DataStructs.TanimotoSimilarity)
+        # If any of the fingerprints doesn't exist, set coefficient to zero.
         else:
             dist = 0
         # Append to the flattened upper triangular matrix.
         upper_triangular[_idx] = dist
 
-    tri_upper_indices = np.triu_indices(num_of_smiles, k=1)
+    tanimoto_matrix = np.zeros((num_of_drugs, num_of_drugs))
+
+    tri_upper_indices = np.triu_indices(num_of_drugs, k=1)
     tanimoto_matrix[tri_upper_indices] = upper_triangular
     tanimoto_matrix = tanimoto_matrix + tanimoto_matrix.T
     np.fill_diagonal(tanimoto_matrix, 1)
@@ -92,14 +100,22 @@ if __name__ == '__main__':
             # Set DrugBank as preferred source...
             drug_smile = get_db_smiles(drug.DrugBank_CID)
 
-            # ...and only default to ChEMBL when no SMILES are returned.
+            # ...then default to ChEMBL when no SMILES are returned...
             if not drug_smile:
                 drug_info = filter_results('molecule', drug.ChEMBL_CID)
                 molecule_structures = drug_info.molecule_structures[0]
                 if molecule_structures:
                     drug_smile = molecule_structures['canonical_smiles']
+                # ...and finally prod PubChem's API as last resort.
                 else:
-                    drug_smile = None
+                    drug_name = drug_info.pref_name[0]
+                    pubchem_info = get_compounds(drug_name, 'name')
+                    if pubchem_info:
+                        drug_smile = pubchem_info[0].canonical_smiles
+                    else:
+                        # If no SMILE's found, return None.
+                        drug_smile = None
+
             acquired_data['smile'].append(drug_smile)
 
         # Append all new data to the original DataFrame!
@@ -107,6 +123,16 @@ if __name__ == '__main__':
         _sheet = pd.concat([sheet, column], axis=1)
 
     similarity_matrix = tanimoto_similarity(_sheet)
+    # df = pd.DataFrame(data=similarity_matrix,
+    #                   index=_sheet.DrugBank_CID,
+    #                   columns=_sheet.ChEMBL_CID)
+    df = pd.DataFrame(data=similarity_matrix)
 
-    sns.heatmap(similarity_matrix, vmin=0, vmax=1)
+    # Display and save a cluster-map of the results.
+    sns.clustermap(df, yticklabels=False, xticklabels=False)
+    plt.savefig('tanimoto_clustermap.png', dpi=300,)
     plt.show()
+
+    # Save smiles and tanimoto matrix to spreadsheet.
+    _sheet.to_excel('output_smiles.xlsx')
+    df.to_excel('output_tanimoto_similarity.xlsx')
